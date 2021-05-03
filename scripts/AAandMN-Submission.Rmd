@@ -1,0 +1,1411 @@
+---
+title: "Analyzing Tree Health Using G-LiHT Data"
+author: "Aliya & Minh"
+date: "4/5/2021"
+output:
+  html_document:
+    toc: true
+    theme: united
+    code_folding: "hide"
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_knit$set(echo = FALSE,
+                     message = FALSE,
+                     warning = FALSE,
+                     ggplot2::theme_set(ggplot2::theme_bw()),
+                     root.dir = "F:/Users/aa0856a/ENVS_RS Dropbox/Projects/pix4d/201807XX_Denali_FHM_06/"
+                     # root.dir = "C:/Users/Minh Nguyen/ENVS_RS Dropbox/Projects/pix4d/201807XX_Denali_FHM_06/"
+                     )
+
+# Libraries
+library(dplyr)
+library(tidyverse)
+library(stringr)
+library(caret)
+library(car)
+library(splitstackshape)
+library(MASS)
+library(pracma)
+library(philentropy)
+library(raster)
+library(rgdal)
+library(tree)
+library(ForestTools)
+library(lidR)
+library(mapview)
+library(corrplot)  #for correlogram
+library(e1071)  #for skewness() and kurtosis()
+library(gridExtra)  #for grid.arrange()
+library(RANN)
+library(leaps)
+library(jmv) # frequency table/stat
+library(glmnet)
+```
+
+
+
+
+# Working with Point Cloud
+
+In order to create a dataframe for our tree healthy analysis, we first read all las files from client data folder. Since there were 5 regions (mid, north, south1, south2 and south3), we created a loop to combined the las files into one large las file (main) and added the correct region attribute of the main las file. The last step was to reproject the shapefile that we created on ArcMap to our main las file. To do this, we created a get_las_crowns function. The function takes in two arguments (first argument = las file, second argument = shape file) and provide a las file with treeid and shape id while removing all elements with "NA" treeid. 
+
+Note: Shape id was permanently written onto our las file using add_lasattribute. This allows us to retain a unique id for each of our tree if we ever need it. Treeid attribute was not retained when we write our las file since it is non-numeric.
+
+## Auto-read Las Files
+
+```{r}
+sfm_all <- list.files(path = "../../STV/project_data/point_clouds/",
+                      pattern = "las$", full.names = TRUE) %>% c()
+```
+
+```{r}
+## Import LAS file (using the paths specified above)
+
+for (i in seq_along(sfm_all)) {
+  if(i==1) {
+    start_time <- Sys.time()
+    las_all <- list()
+  }
+  
+  las_all[[str_replace_all(str_match(sfm_all[i], "\\_\\w*\\_"),"\\_|sfm", "")]] <- lidR::readLAS(sfm_all[i]) %>% 
+    add_attribute(str_replace_all(str_match(sfm_all[i], "\\_\\w*\\_"),"\\_|sfm", ""), "region")
+ 
+  if(i==length(sfm_all)) {
+    las_all <- do.call(rbind,las_all)
+    end_time <- Sys.time()
+    print(paste0("Processing Time: ", end_time - start_time)) # 26.8120880126953 secs
+  } 
+  
+}
+```
+
+## Reproject Shapefile to Las File
+
+```{r,eval=FALSE}
+# Created get_las_crowns function (first argument = las file, second argument = shape file)
+
+get_las_crowns <- function(las, shape) {
+  
+  start_time <- Sys.time()
+  
+  las_crs <- crs(las, asText = FALSE)
+  fhm_crowns_reproj <- spTransform(shape,las_crs)
+  las_extent <- extent(las)
+  fhm_crowns_shp_sub <- crop(fhm_crowns_reproj, las_extent)
+  
+  # for points that land within each polygon, add the "treeid" attribute from the shapefile to the las dataset
+  all_las_crowns <- merge_spatial(las, fhm_crowns_shp_sub, "treeid") # filter such that only points within the polygons remains
+  all_las_crowns <- merge_spatial(all_las_crowns, fhm_crowns_shp_sub, "Id") # add in id - comment out to reduce time
+  
+  all_las_crowns <- filter_poi(all_las_crowns, treeid != "NA") # filter out NA treeid
+  
+  all_las_crowns <<- add_lasattribute(all_las_crowns, all_las_crowns@data$Id, "Id", "Shape ID#") # add Id as a las attribute into the las file - "extra bytes"
+  
+  end_time <- Sys.time()
+  time <- paste0("Processing Time: ", end_time - start_time)
+  output <- list(time, all_las_crowns)
+  
+  return(output)
+}
+
+get_las_crowns(las_all, fhm_crowns_shp) # 7.99595518509547 mins (LAS dimension: 233153 rows x23 columns)
+```
+
+# Reading Files (Shape, Las and CSV)
+
+```{r}
+#sfm_dir <- "C:/Users/Minh Nguyen/ENVS_RS Dropbox/Projects/pix4d/201807XX_Denali_FHM_06/"
+
+#Read in hand drawn crowns shapefile for cal/val
+#fhm_crowns_shp <- readOGR(paste0(sfm_dir, "../../Alaska/fhm_2018_uav/ak_spruce_crowns.shp"))
+fhm_crowns_shp <- readOGR("../../Alaska/fhm_2018_uav/ak_spruce_crowns.shp")
+
+# Read in LAS file
+#all_las_crowns <- readLAS(paste0(sfm_dir, "../../STV/code/R/AliyaMinh/data/all_las_crowns.las"))
+all_las_crowns <- readLAS("../../STV/code/R/AliyaMinh/data/all_las_crowns.las")
+
+# Not needed unless you want to process the las files again and re-add treeid (already in the raw_df)
+all_las_crowns <- merge_spatial(all_las_crowns, fhm_crowns_shp, "treeid") # filter such that only points within the polygons remains
+
+# Read in csv and las files
+#raw_df <- read.csv(paste0(sfm_dir, "../../STV/code/R/AliyaMinh/data/raw_df.csv")) %>% 
+raw_df <- read.csv( "../../STV/code/R/AliyaMinh/data/raw_df.csv") %>% 
+  mutate(region = as.factor(region),
+         status = as.factor(status))
+
+#missing_df <- read.csv(paste0(sfm_dir, "../../STV/code/R/AliyaMinh/data/missing_df.csv")) %>% 
+missing_df <- read.csv("../../STV/code/R/AliyaMinh/data/missing_df.csv") %>%   
+  mutate(confirmed = as.factor(confirmed)) 
+```
+
+# Descriptive Analysis
+
+We started our analysis by checking our point cloud data. We looked at height (Z) and status. Though the points do not directly tell us anything, it is always good to know what our data is comprised of before delving any deeper. You will notice that in our raw data frame we have three statuses (A=Alive, G=Green and D=Dead). However, the goal was to focus on Alive vs Dead so all Green points/trees were removed. For more on basic analysis of our point cloud, please look at the descriptive.R file.
+
+```{r}
+# Missing Trees
+missing_trees <- missing_df %>% filter(confirmed == 0)
+missing_trees[1] # HWY3_53D, HWY3_52D, HWY2_30A, HWY2_29D, HWY2_28G, HWY4_62A, HWY5_103A, HWY5_100A, HWY5_101A, HWY5_102A, HWY5_99A, HWY5_97A, HWY5_98G, HWY5_90A, HWY5_92G
+
+# Status
+summary(raw_df$status)
+
+# Height of points
+summary(raw_df$Z)
+
+# this will plot the Z values and flip the histogram 90 degrees to make it more intuitive since we're examining elevations/heights
+ggplot(data=raw_df, aes(x=Z)) + geom_histogram(color= "black", fill="transparent", alpha=0.5, position="identity", binwidth = 1) +  theme_minimal() + coord_flip() + xlim(-5,30)
+```
+
+We randomly chose one Alive and one Dead tree to check our assumption that Alive trees would have more Green at higher height than Dead trees. Below are the Alive and Dead trees' 3d plot.
+
+![Alive](F:/Users/aa0856a/ENVS_RS Dropbox/Projects/STV/code/R/AliyaMinh/images/alive_pointcloud.png)
+
+![Dead](F:/Users/aa0856a/ENVS_RS Dropbox/Projects/STV/code/R/AliyaMinh/images/dead_pointcloud.png)
+
+The 2 randomly selected trees were HWY5_112A (Alive) and HWY4_64D (Dead). Below are the plots showing the point distribution for G and R.
+
+```{r}
+unique(all_las_crowns@data$treeid)
+
+tree_A <- filter_poi(all_las_crowns, treeid == "HWY5_112A")
+tree_D <- filter_poi(all_las_crowns, treeid == "HWY4_64D")
+#plot(tree_G, size = 8, bg = "white")
+#plot(tree_D, size = 8, bg = "white")
+
+# plot vertical structure of this tree
+#dev.new(); hist(tree@data$Z)
+
+# plot green and red at different height for Alive and Dead trees as example of a potential variable of interest
+par(mfrow=c(2,2))
+plot(tree_A@data$Z, tree_A@data$G)
+plot(tree_A@data$Z,tree_A@data$R)
+plot(tree_D@data$Z, tree_D@data$G)
+plot(tree_D@data$Z,tree_D@data$R)
+```
+
+To gain a visual understanding of the distribution of height (Z) in our dataset, we created a plot with median, 10%, 75% and 98% height markers.
+
+```{r}
+# mean and median height of points in this las file also percentile (or quantile) heights. 
+# For example, what is the Z value below which 90% of points exist ("pct90") in this study area?
+raw_df_summary <- raw_df %>% summarise(mean=mean(Z), pct10=quantile(Z,.1), pct30=quantile(Z,.3),
+                    median=median(Z), pct75=quantile(Z,.75), pct90=quantile(Z,.90), pct98=quantile(Z,.98))
+
+# histogram with pct10, mean, and pct90 plotted on top with green, red, and orange lines respectively
+ggplot(data=raw_df, aes(x=Z)) + geom_histogram(color= "black", fill="transparent", alpha=0.5, position="identity", binwidth = 1) +  theme_minimal() + coord_flip() + 
+  geom_vline(aes(xintercept = mean(Z)),col='red',size=1) + # <-- this line is at the mean height
+  geom_text(aes(x=12, label="Med", y=-700), colour="red", text=element_text(size=10)) +
+  geom_vline(aes(xintercept = quantile(Z,0.1)),col='green',size=1) + # <-- this line is at pct10 height
+  geom_text(aes(x=3.5, label="Pct10", y=-700), colour="green", text=element_text(size=10)) +
+  geom_vline(aes(xintercept = quantile(Z,0.75)),col='orange',size=1) + # <-- this line is at pct75 height
+  geom_text(aes(x=16, label="Pct75", y=-700), colour="orange", text=element_text(size=10)) +
+  geom_vline(aes(xintercept = quantile(Z,0.98)),col='blue',size=1) + # <-- this line is at pct98 height
+  geom_text(aes(x=23, label="Pct98", y=-700), colour="blue", text=element_text(size=10))
+
+#show all the quantile values calculated above
+raw_df_summary
+```
+
+# Pre-Processing and Feature Extraction
+
+From our point cloud data, we extracted features using x, y, z, red, green and blue values. Our variables/features vary from quantile value to skewness to ratio of the original point cloud values.
+
+```{r}
+model_df <- raw_df %>%
+  group_by(treeid) %>%
+  #find color statistics
+  mutate(height = max(Z),
+         ht_mean = mean(Z),
+         ht_skw_Sp = skewness(Z),
+         ht_kurt_sp = kurtosis(Z),
+         ht_75p = as.numeric(quantile(Z, 0.75)),
+         ht_90p = as.numeric(quantile(Z, 0.9)), 
+         ht_98p = as.numeric(quantile(Z, 0.98)),
+         green_75p = mean(G[Z >= ht_75p]),
+         green_90p = mean(G[Z >= ht_90p]),
+         green_98p = mean(G[Z >= ht_98p]),
+         red_75p = mean(R[Z >= ht_75p]),
+         red_90p = mean(R[Z >= ht_90p]),
+         red_98p = mean(R[Z >= ht_98p]),
+         blue_75p = mean(B[Z >= ht_75p ]),
+         blue_90p = mean(B[Z >= ht_90p]),
+         blue_98p = mean(B[Z >= ht_98p]),
+         greenness_75p = mean(G[Z >= ht_75p]/(R[Z >= ht_75p]+B[Z >= ht_75p])),
+         greenness_90p = mean(G[Z >= ht_90p]/(R[Z >= ht_90p]+B[Z >= ht_90p])),
+         greenness_98p = mean(G[Z >= ht_98p]/(R[Z >= ht_98p]+B[Z >= ht_98p])),
+         redness_75p = mean(R[Z >= ht_75p]/(G[Z >= ht_75p]+B[Z >= ht_75p])),
+         redness_90p = mean(R[Z >= ht_90p]/(G[Z >= ht_90p]+B[Z >= ht_90p])),
+         redness_98p = mean(R[Z >= ht_98p]/(G[Z >= ht_98p]+B[Z >= ht_98p])),
+         blueness_75p = mean(B[Z >= ht_75p]/(G[Z >= ht_75p]+R[Z >= ht_75p])),
+         blueness_90p = mean(B[Z >= ht_90p]/(G[Z >= ht_90p]+R[Z >= ht_90p])),
+         blueness_98p = mean(B[Z >= ht_98p]/(G[Z >= ht_98p]+R[Z >= ht_98p])),
+         med_height = median(Z),
+         blueness_mean = mean((B - G)/(B + G)),
+         greenness_mean = mean((G - R)/(G + R)),
+         redness_mean = mean((R - B)/(R + B)),
+         blueness_std = sd((B - G)/(B + G)),
+         greenness_std = sd((G - R)/(G + R)),
+         redness_std = sd((R - B)/(R + B)),
+         blueness_med = median((B - G)/(B + G)),
+         greenness_med = median((G - R)/(G + R)),
+         redness_med = median((R - B)/(R + B)),
+         blueness_skw = skewness((B - G)/(B + G)),
+         greenness_skw = skewness((G - R)/(G + R)),
+         redness_skw = skewness((R - B)/(R + B)),
+         #find overall brightness statistics
+         brightness_mean = mean(B + G + R),
+         brightness_med = median(B + G + R),
+         brightness_std = sd(B + G + R),
+         brightness_skw = skewness(B + G + R),
+         #find normalized statistics
+         red_norm_mean = mean(R / (R + G + B)),
+         blue_norm_mean = mean(B / (R + G + B)),
+         green_norm_mean = mean(G / (R + G + B)),
+         R = mean(R),
+         G = mean(G),
+         B = mean(B),
+         R_ratio = R/(R + G + B ),
+         G_ratio = G/(R + G + B ),
+         B_ratio = B/(R + G + B ),
+         G_R_ratio = G/R,
+         G_R_ratio_2 = (G - R)/(G + R))%>% 
+  dplyr::select(Id, treeid, status, region, R:G_R_ratio_2)
+```
+
+To simplify our dataset and speed up our models, we transformed our point cloud to one row per tree by grouping the dataset with treeid. 
+
+```{r}
+model_df <-model_df %>% group_by(treeid) %>% 
+  filter(row_number()==1) %>%
+  as.data.frame() %>%
+  dplyr::select(-c(treeid, Id, region))
+
+model_df <- model_df %>%
+  filter(status != "G") %>%
+  mutate(status = factor(status))
+```
+
+## Summary of our new dataframe
+
+The final data frame to be used in our models has 80 observations: 47 Alive (A) and 33 Dead (D) trees, 58.75% and 41.25% respectively. 
+
+We will be using Accuracy and Kappa Coefficient of Agreement to compare our models in subsequent sections. Kappa essentially lets us know how much better are our models (information/algorithmic efficiency) than chance. 
+
+Below are the summary of all of the features extracted:
+
+```{r}
+descriptives(model_df, vars = vars(status), freq = TRUE)
+
+summary(model_df)
+```
+
+We also checked some of our basic assumptions here:
+
+* Total Green Count (A vs D)
+    + You can see that Alive trees appear to have higher Green values
+* Greenness (ratio of green) at 75% and 90%
+    + Alive trees appear to have a more "normal" Greeness distribution with peak around 0.65
+    + Dead trees appear to be skewed to the right with most of the Greeness less than 0.6
+* Height Comparison (A vs D)
+    + Alive trees appear to be less sparse
+* Height at 75% and 90%
+    + Alive trees appear to be less sparse at both 75% and 90% height
+
+
+```{r}
+model_df %>%
+  ggplot(aes(x = G, fill=status)) +
+  geom_histogram() +
+  scale_colour_manual(values = c("green", "red"), 
+  aesthetics = c("colour", "fill")) +
+  labs(title="Total Green Count", x="Green")
+
+model_df %>% 
+  ggplot() +
+  geom_histogram(aes(x = greenness_75p, fill = "orange")) +
+  geom_histogram(aes(x = greenness_90p, fill = "blue")) +
+  labs(title="Greenness at 75% and 90%", x="Greenness") +
+  scale_fill_discrete(labels = c("75%", "90%")) +
+  guides(fill=guide_legend(title="Quantile")) +
+  facet_wrap(~status)
+
+model_df %>%
+  ggplot(aes(x = height, fill=status)) +
+  geom_histogram() +
+  scale_colour_manual(values = c("green", "red"), 
+  aesthetics = c("colour", "fill")) +
+  labs(title="Height Comparison", x="Height")
+
+model_df %>% 
+  ggplot() +
+  geom_histogram(aes(x = ht_75p, fill = "orange")) +
+  geom_histogram(aes(x = ht_90p, fill = "blue")) +
+  labs(title="Height at 75% and 90%", x="Height") +
+  scale_fill_discrete(labels = c("75%", "90%")) +
+  guides(fill=guide_legend(title="Quantile")) +
+  facet_wrap(~status)
+```
+
+## Checking Multicolinearity
+
+It is hard to fully see our multicolinearity issue in the plot below due to having too many variables. However, you can clearly see the strong blue (positive correlation) and red (negative correlation) in the plot.
+
+```{r}
+corr <- as.data.frame(model_df) %>%
+  dplyr::select(-status) %>% # loading dplyr because raster package causing issues
+  cor()
+
+corrplot(cor(corr), method="color", type = "upper", tl.col="black",tl.srt=40, addCoef.col = "gray8", diag = T, number.cex = 0.65)
+```
+
+
+# Variable Selection
+
+Linear model has distinct advantages in terms of inference and, on real - world problems, is often surprisingly competitive in relation to non -linear methods. Hence, before moving to the non linear world, we will look at what we have from two aspects : 
+
+- `Prediction accuracy`: Looking at our dataset, number of observation is not much larger than p, then there can be a lot of variability in the least squares fit resulting in overfitting and consequently poor predictions on future observations not used in the training model.By constraining or shrinking the estimated coefficients, we can often substantially reduce the variance at the cost of a negligible increase in bias. This can lead to substantial improvements in the accuracy with which we can predict the response for observation not used in model training. 
+
+- `Model interpretability`: It is often the case that some of many of the variables used in a multiple regression model are in fact not associated with the response. Including such irrelevant variables leads to unnecessary complexity in the resulting model. By removing these variables - that is, by setting corresponding coefficient estimates to zero - we can obtain a model that is more easily interpreted. 
+
+Here, I am evaluating some of the variable selection, shrinkage methods to reduce the dimension in our dataset.
+
+What other methods:
+
+## 1) Best Subset Selection
+
+The number of possible models that must be considered grows rapidly as p increases. In general there are 2p models that involve subset of p predictors. So if p = 45 we are looking at:
+
+```{r}
+2^45   # computationally expensive
+```
+
+For computational reason, best subset selection cannot be applied with very large p - an enormous search space can lead to overfitting and high variance of the coefficient estimates. 
+
+So, stepwise methods are, which explore a far more restricted set of models, are attractive alternative to best subset selection. 
+
+## 2) Forward stepwise
+
+Forward stepwise: begins with a model containing no predictors, and then adds predictors to the model, one at a time, until all of the predictors are in the model. In particular, at each step the variable that gives the greatest additional improvement to the fit is added to the model.
+
+```{r}
+reg.fit.fwd <- regsubsets(status~.,data = model_df,nvmax=53,method = "forward")
+
+reg.fwd.summary <- summary(reg.fit.fwd)
+```
+
+Plots:
+
+```{r}
+par(mfrow=c(1,3))
+
+plot(reg.fwd.summary$cp, xlab = ' Number of Variables ' , ylab = 'Cp')
+# which.min(reg.fwd.summary$cp)  # min at 19
+points(19, reg.fwd.summary$cp[19], col = "red",cex =2, pch = 20)
+
+# which.min(reg.fwd.summary$bic)  #min at 8
+plot(reg.fwd.summary$bic, xlab = ' Number of Variables ' , ylab = 'BIC')
+points(8, reg.fwd.summary$bic[8], col = "red",cex =2, pch = 20)
+
+
+plot(reg.fwd.summary$adjr2, xlab = ' Number of Variables ' , ylab = 'Adjusted Rsquared')
+# which.max(reg.fwd.summary$adjr2) # max at 34
+points(34, reg.fwd.summary$adjr2[34], col = "red",cex =2, pch = 20)
+```
+
+Cp, BIC, and adjusted Rsquared are shown for the best models of each size for model_df dataset. Cp and BIC are estimates of test MSE. 
+
+Mallow Cp is decreasing first at hit its lowest at 19 variables.
+
+BIC, also decreases first and at its lowest at 8 or 10 then start increasing. 
+
+Adjusted R squared has sharp increases up until around 20 and reach its maximum around 33-34 then it starts to decline.
+
+
+Plotting forward variables: 
+
+```{r}
+plot(reg.fit.fwd)  # region north,R,  G, ht_75p
+plot(reg.fit.fwd, scale = "adjr2") # region north, region sount2, region south3, R,G, ht_90p, blueness_med, redness_skw, brightness_skw, R_ratio, ht_mean
+plot(reg.fit.fwd, scale = "Cp")
+```
+
+```{r}
+coef(reg.fit.fwd,9)
+```
+
+## 3) Backward stepwise
+
+Unlike forward, backward begins with the full least squares model containing all p predictors, and then iteratively remove the least useful predictor, one at a time.Problem with this method, since it starts with the over-identified model, it may suffer dimentionality issues as we remove variables, some variables that were not significant may become significant if added again. 
+
+Backward selection requires that the number of samples n is larger than the number of  variables p ( so the full model can be fit). In contrast, forward stepwise can be used even when n<p, and so is the only viable subset method when p is large.
+
+```{r, echo = FALSE, message = FALSE, warning = FALSE}
+
+reg.fit.bwd <- regsubsets(status~.,data = model_df,nvmax=53, method = "backward")
+
+reg.bwd.summary = summary(reg.fit.bwd)
+# which.min(reg.bwd.summary$cp)  # min at 13, curve flattens around 7 or 8
+# which.min(reg.bwd.summary$bic)  # min at 8
+
+par(mfrow=c(1,3))
+plot(reg.bwd.summary$cp, xlab = ' Number of Variables ' , ylab = 'Cp')
+# which.min(reg.bwd.summary$cp)  # min at 13
+points(13, reg.bwd.summary$cp[13], col = "red",cex =2, pch = 20)
+
+# which.min(reg.bwd.summary$bic) # 8
+plot(reg.bwd.summary$bic, xlab = ' Number of Variables ' , ylab = 'BIC')
+points(8, reg.bwd.summary$bic[8], col = "red",cex =2, pch = 20)
+
+# which.max(reg.bwd.summary$adjr2) #33
+plot(reg.bwd.summary$adjr2, xlab = ' Number of Variables ' , ylab = 'Adjusted R squared')
+points(33, reg.bwd.summary$adjr2[33], col = "red",cex =2, pch = 20)
+
+```
+Cp, BIC, and adjusted Rsquared are shown for the best models of each size for model_df dataset. Cp and BIC are estimates of test MSE. 
+
+Mallow Cp is decreasing first at hit its lowest around 10-13 variables.
+
+BIC, also decreases first and at its lowest at 8 then starst increasing. 
+
+Adjusted R squared has sharp increases up until around 20 and reach its maximum around 33-34 then it starts to decline.
+
+
+
+
+```{r}
+
+plot(reg.fit.bwd) # 
+plot(reg.fit.bwd, scale = "adjr2") # 
+
+coef(reg.fit.bwd, 8)
+# coef(reg.fit.bwd, 9)
+# coef(reg.fit.bwd, 10)
+```
+
+# Shrinkage Methods
+
+Lasso uses L1 norm instead of L2 Norm. L1 will force some of the coefficient estimates to be exactly '0' when lambda is large enough. Additionally, glmnet also standardizes the variables. 
+
+Accuracy Assessment for LASSO  model:
+
+Status          | Producer's Accuracy | Omission       | User's Accuracy | Commission
+:-------------  | :-------------      | :------------- | :-------------  | :------------- 
+Alive           | 0.95833333          | 0.04166667     | 0.7931034       | 0.4250000
+Dead            | 0.625               | 0.375          | 0.90909091      | 0.09090909
+
+
+
+
+```{r}
+grid = 10^seq(10,-2, length=100) # grid value ranging 10^10 to 10^-2, essentially covering the full range of scenarios from null model containing only the intercept, to the least square fit.
+x = model.matrix(status~.,data=model_df)[,-1] # this will transform any qualitative variables into dummy variables
+y = model_df$status
+set.seed(1)
+train = sample(1:nrow(x), nrow(x)/2)
+test = (-train)
+y.test = y[test]
+
+lasso.mod = glmnet(x[train,], y[train],alpha =1, family = "binomial",lambda=grid)
+plot(lasso.mod)
+```
+
+We can see from the coefficient plot that depending on the choice of tuning parameter, some of the coefficients will be exactly equal to 0. We now perform cross - validation and compute the associated test error:
+
+```{r}
+
+model_df <- model_df %>%
+  filter(status != "G") %>%
+  mutate(status = factor(status))
+
+# Perform 10 fold validation and find the optimum lambda & Classification performance on test data
+set.seed(1)
+cfit = cv.glmnet(x[train,],y[train],family = "binomial",alpha = 1) 
+
+plot(cfit)
+
+bestlam = cfit$lambda.min
+
+# lasso.pred = predict(lasso.mod, s=bestlam, newx= x[test,])
+
+cnf <- confusion.glmnet(cfit, newx = x[test, ], newy = y[test])
+print(cnf)
+
+
+c("A Producer's Accuracy"=cnf[1,1]/sum(cnf[,1]),"A Omission"=1-(cnf[1,1]/sum(cnf[,1]))) # 95.83% (4.16667%)
+
+c("D Producer's Accuracy"=cnf[2,2]/sum(cnf[,2]),"D Omission"=1-(cnf[2,2]/sum(cnf[,2]))) # 62.5% (37.5%)
+
+c("A User's Accuracy"=cnf[1,1]/sum(cnf[1,]),"A Commission"=1-(cnf[1,1]/sum(cnf))) # 79.3% (42.5%)
+
+c("D User's Accuracy"=cnf[2,2]/sum(cnf[2,]),"D Commission"=1-(cnf[2,2]/sum(cnf[2,]))) # 0.91% (9%)
+
+TruN <- cnf[1,1] # correct alive predictions
+TruP <- cnf[2,2] # correct dead predictions
+FalP <- cnf[2,1] # actual dead, predicted alive  #1
+FalN <- cnf[1,2] # actual alive, predicted dead  #17  
+TotN <- cnf[1,1] + cnf[2,1] # actual total  Alive (Bottom left) #17
+TotP <- cnf[1,2] + cnf[2,2]  # actual total Dead (bottom right) #7
+Tot <- TotN + TotP
+TotUA <-  cnf[1,1] + cnf[1,2]  #16
+TotDA <-  cnf[2,1] + cnf[2,2]  #8
+Accuracy <- (TruN+TruP)/Tot
+Kappa <-(Tot *(TruN + TruP) - ((TotUA*TotN) + (TotDA* TotP)))/((Tot^2) - ((TotUA*TotN) + (TotDA* TotP))) # 0.9032258
+
+Error <- (FalN+FalP)/Tot
+sensitivity <- TruP/TotP # How good is our model at predicting positive - D
+Specificity <- TruN/TotN # How good is our model at predicting negative - A
+FalPos <- 1- Specificity # Predicting dead when it's alive rate
+
+c("Accuracy"=Accuracy, "Error"=Error, "sensitivity"=sensitivity, "Specificity"=Specificity, "FalPos"=FalPos, "Kappa"=Kappa)
+
+```
+
+Fit the final model = coefficients chosen by cross validation
+
+```{r}
+
+x = model.matrix(status~.,data=model_df)[,-1] # this will transform any qualitative variables into dummy variables
+y = model_df$status
+
+out = glmnet(x,y,alpha=1,family = c("binomial"), lambda=grid)
+
+lasso.coef = predict(out, type = "coefficients", s= bestlam)
+
+rownames(lasso.coef)[which(lasso.coef!=0)] # lasso coefficients that kept
+
+# green_98p,greenness_std,blueness_med,brightness_skw,G_ratio 
+
+
+```
+
+
+
+
+# Logistic Regression
+
+Running Logistic Regression with variables chosen from different variable selection method
+
+```{r}
+fwd <- model_df%>%
+  dplyr::select(status,ht_98p, green_98p, red_98p, brightness_std, red_norm_mean, G_ratio, G_R_ratio_2, green_norm_mean, B_ratio )
+
+bwd <- model_df%>%
+  dplyr::select(status,red_75p, redness_75p, redness_98p, blue_norm_mean,R_ratio, G_R_ratio,green_norm_mean, B_ratio) 
+Lasso <-  model_df%>%
+  dplyr::select(status, green_98p, greenness_std, blueness_med, brightness_skw, G_ratio)
+
+finaldf <- model_df%>%
+  dplyr::select(status,ht_98p, green_98p, redness_75p, G_ratio, B_ratio )
+```
+
+## Logistic regression with all variables
+
+```{r}
+set.seed(1)
+n= length(model_df$status)
+
+Z = sample(1:nrow(model_df), 0.7*nrow(model_df))
+model_df_train <- model_df[Z,]
+model_df_test <- model_df[-Z,]
+
+levels(model_df$status)
+
+glm.fits = glm(status~ ., data = model_df_train, family = binomial)
+#summary(glm.fits)
+Prob=fitted.values(glm.fits)
+
+
+Probability = predict(glm.fits,model_df_test, type="response")
+
+# contrasts(model_df$status)  # contrast() function indicates that R has created a dummy variable with a 1 for "D" - Dead trees
+
+#  extracting the fitted values from "fit"
+Prob=fitted.values(glm.fits)
+
+
+# We will classify "Dead trees" as having the probability that exceeds 0.5.
+
+Predicted.Direction <- ifelse(Probability>0.5,"D","A")
+
+
+model_df_conf <- table("Predicted"=Predicted.Direction,"Actual"=model_df_test$status)
+model_df_conf
+
+c("A Producer's Accuracy"=model_df_conf[1,1]/sum(model_df_conf[,1]),"A Omission"=1-(model_df_conf[1,1]/sum(model_df_conf[,1]))) # 94.12% (5.88%)
+
+c("D Producer's Accuracy"=model_df_conf[2,2]/sum(model_df_conf[,2]),"D Omission"=1-(model_df_conf[2,2]/sum(model_df_conf[,2]))) # 100% (0%)
+
+c("A User's Accuracy"=model_df_conf[1,1]/sum(model_df_conf[1,]),"A Commission"=1-(model_df_conf[1,1]/sum(model_df_conf))) # 100% (0%)
+
+c("D User's Accuracy"=model_df_conf[2,2]/sum(model_df_conf[2,]),"D Commission"=1-(model_df_conf[2,2]/sum(model_df_conf[2,]))) # 87.5% (12.5%)
+
+TruN <- model_df_conf[1,1] # correct alive predictions
+TruP <- model_df_conf[2,2] # correct dead predictions
+FalP <- model_df_conf[2,1] # actual dead, predicted alive  #1
+FalN <- model_df_conf[1,2] # actual alive, predicted dead  #17  
+TotN <- model_df_conf[1,1] + model_df_conf[2,1] # actual total  Alive (Bottom left) #17
+TotP <- model_df_conf[1,2] + model_df_conf[2,2]  # actual total Dead (bottom right) #7
+Tot <- TotN + TotP
+TotUA <-  model_df_conf[1,1] + model_df_conf[1,2]  #16
+TotDA <-  model_df_conf[2,1] + model_df_conf[2,2]  #8
+Accuracy <- (TruN+TruP)/Tot
+Kappa <-(Tot *(TruN + TruP) - ((TotUA*TotN) + (TotDA* TotP)))/((Tot^2) - ((TotUA*TotN) + (TotDA* TotP))) # 0.9032258
+
+Error <- (FalN+FalP)/Tot
+sensitivity <- TruP/TotP # How good is our model at predicting positive - D
+Specificity <- TruN/TotN # How good is our model at predicting negative - A
+FalPos <- 1- Specificity # Predicting dead when it's alive rate
+
+c("Accuracy"=Accuracy, "Error"=Error, "sensitivity"=sensitivity, "Specificity"=Specificity, "FalPos"=FalPos, "Kappa"=Kappa)
+```
+
+
+## Logistic regression with FWD selected variables
+
+Deviance Residual look good since they are close to being centered on 0 and are roughly symmetrical.
+
+model          | Accuracy       | Kappa
+:------------- | :------------- | :-------------
+forward        | 0.95833333     | 0.90322581
+backward       | 0.8750000      | 0.7096774
+
+Accuracy Assessment for fwd_glm model (best glm):
+
+Status          | Producer's Accuracy | Omission       | User's Accuracy | Commission
+:-------------  | :-------------      | :------------- | :-------------  | :------------- 
+Alive           | 0.94117647          | 0.05882353     | 1               | 0
+Dead            | 1                   | 0              | 0.875           | 0.125
+
+```{r}
+set.seed(1)
+n= length(fwd$status)
+
+Z = sample(1:nrow(fwd), 0.7*nrow(fwd))
+fwd_train <- fwd[Z,]
+fwd_test <- fwd[-Z,]
+
+levels(fwd$status)
+
+glm.fits = glm(status~ ., data = fwd_train, family = binomial)
+summary(glm.fits)
+
+Prob=fitted.values(glm.fits)
+summary(Prob)
+
+Probability = predict(glm.fits,fwd_test, type="response")
+
+# contrasts(fwd$status)  # contrast() function indicates that R has created a dummy variable with a 1 for "D" - Dead trees
+
+#  extracting the fitted values from "fit"
+Prob=fitted.values(glm.fits)
+summary(Prob)
+
+# We will classify "Dead trees" as having the probability that exceeds 0.5.
+
+Predicted.Direction <- ifelse(Probability>0.5,"D","A")
+
+
+fwd_conf <- table("Predicted"=Predicted.Direction,"Actual"=fwd_test$status)
+fwd_conf
+
+c("A Producer's Accuracy"=fwd_conf[1,1]/sum(fwd_conf[,1]),"A Omission"=1-(fwd_conf[1,1]/sum(fwd_conf[,1]))) # 94.12% (5.88%)
+
+c("D Producer's Accuracy"=fwd_conf[2,2]/sum(fwd_conf[,2]),"D Omission"=1-(fwd_conf[2,2]/sum(fwd_conf[,2]))) # 100% (0%)
+
+c("A User's Accuracy"=fwd_conf[1,1]/sum(fwd_conf[1,]),"A Commission"=1-(fwd_conf[1,1]/sum(fwd_conf))) # 100% (0%)
+
+c("D User's Accuracy"=fwd_conf[2,2]/sum(fwd_conf[2,]),"D Commission"=1-(fwd_conf[2,2]/sum(fwd_conf[2,]))) # 87.5% (12.5%)
+
+TruN <- fwd_conf[1,1] # correct alive predictions
+TruP <- fwd_conf[2,2] # correct dead predictions
+FalP <- fwd_conf[2,1] # actual dead, predicted alive  #1
+FalN <- fwd_conf[1,2] # actual alive, predicted dead  #17  
+TotN <- fwd_conf[1,1] + fwd_conf[2,1] # actual total  Alive (Bottom left) #17
+TotP <- fwd_conf[1,2] + fwd_conf[2,2]  # actual total Dead (bottom right) #7
+Tot <- TotN + TotP
+TotUA <-  fwd_conf[1,1] + fwd_conf[1,2]  #16
+TotDA <-  fwd_conf[2,1] + fwd_conf[2,2]  #8
+Accuracy <- (TruN+TruP)/Tot
+Kappa <-(Tot *(TruN + TruP) - ((TotUA*TotN) + (TotDA* TotP)))/((Tot^2) - ((TotUA*TotN) + (TotDA* TotP))) # 0.9032258
+
+Error <- (FalN+FalP)/Tot
+sensitivity <- TruP/TotP # How good is our model at predicting positive - D
+Specificity <- TruN/TotN # How good is our model at predicting negative - A
+FalPos <- 1- Specificity # Predicting dead when it's alive rate
+
+c("Accuracy"=Accuracy, "Error"=Error, "sensitivity"=sensitivity, "Specificity"=Specificity, "FalPos"=FalPos, "Kappa"=Kappa)
+
+ll.null <- glm.fits$null.deviance/-2
+ll.proposed <- glm.fits$deviance/-2
+
+(ll.null - ll.proposed) / ll.null  # Rsquared = 0.54
+```
+
+## Logistic regression with BWD selected variables
+
+Accuracy Assessment for bwd_glm model:
+
+Status          | Producer's Accuracy | Omission       | User's Accuracy | Commission
+:-------------  | :-------------      | :------------- | :-------------  | :------------- 
+Alive           | 0.8823529           | 0.1176471      | 0.9375          | 0.3750 
+Dead            | 0.8571429           | 0.1428571      | 0.75            | 0.25
+
+```{r}
+set.seed(1)
+n= length(bwd$status)
+
+Z = sample(1:nrow(bwd), 0.7*nrow(bwd))
+bwd_train <- bwd[Z,]
+bwd_test <- bwd[-Z,]
+
+
+glm.fits = glm(status~ ., data = bwd_train, family = binomial)
+summary(glm.fits)
+
+Probability = predict(glm.fits,bwd_test, type="response")
+
+# contrasts(bwd$status)  # contrast() function indicates that R has created a dummy variable with a 1 for "D" - Dead trees
+
+
+Predicted.Direction <- ifelse(Probability>0.5,"D","A")
+Predicted.Direction
+
+bwd_conf <- table("Predicted"=Predicted.Direction,"Actual"=bwd_test$status)
+bwd_conf
+
+
+c("A Producer's Accuracy"=bwd_conf[1,1]/sum(bwd_conf[,1]),"A Omission"=1-(bwd_conf[1,1]/sum(bwd_conf[,1]))) # 88.23% (0.1176%)
+
+c("D Producer's Accuracy"=bwd_conf[2,2]/sum(bwd_conf[,2]),"D Omission"=1-(bwd_conf[2,2]/sum(bwd_conf[,2]))) # 85.714% (0.1428%)
+
+c("A User's Accuracy"=bwd_conf[1,1]/sum(bwd_conf[1,]),"A Commission"=1-(bwd_conf[1,1]/sum(bwd_conf))) # 93.75% (0.3750%)
+
+c("D User's Accuracy"=bwd_conf[2,2]/sum(bwd_conf[2,]),"D Commission"=1-(bwd_conf[2,2]/sum(bwd_conf[2,]))) # 75% (25%)
+
+
+TruN <- bwd_conf[1,1] # correct alive predictions
+TruP <- bwd_conf[2,2] # correct dead predictions
+FalP <- bwd_conf[2,1] # actual dead, predicted alive
+FalN <- bwd_conf[1,2] # actual alive, predicted dead
+TotN <- bwd_conf[1,1] + bwd_conf[2,1] # actual total  Alive
+TotP <- bwd_conf[1,2] + bwd_conf[2,2]  # actual total Dead
+Tot <- TotN + TotP
+
+TotUA <-  bwd_conf[1,1] + bwd_conf[1,2] 
+TotDA <-  bwd_conf[2,1] + bwd_conf[2,2] 
+
+Kappa <-(Tot *(TruN + TruP) - ((TotUA*TotN) + (TotDA* TotP)))/((Tot^2) - ((TotUA*TotN) + (TotDA* TotP))) # 70.96
+
+Accuracy <- (TruN+TruP)/Tot
+Error <- (FalN+FalP)/Tot
+sensitivity <- TruP/TotP # How good is our model at predicting positive - D
+Specificity <- TruN/TotN # How good is our model at predicting negative - A
+FalPos <- 1- Specificity # Predicting as dead when its alive (classifying incorrectly)
+
+c("Accuracy"=Accuracy, "Error"=Error, "sensitivity"=sensitivity, "Specificity"=Specificity, "FalPos"=FalPos,"Kappa"=Kappa)
+
+ll.null <- glm.fits$null.deviance/-2
+ll.proposed <- glm.fits$deviance/-2
+
+(ll.null - ll.proposed) / ll.null  # Rsquared = 0.72
+```
+
+## Logistic regression with Lasso selected variables
+
+```{r}
+set.seed(1)
+n= length(Lasso$status)
+
+Z = sample(1:nrow(Lasso), 0.7*nrow(Lasso))
+Lasso_train <- Lasso[Z,]
+Lasso_test <- Lasso[-Z,]
+
+
+glm.fits = glm(status~ ., data = Lasso_train, family = binomial)
+summary(glm.fits)
+
+Probability = predict(glm.fits,Lasso_test, type="response")
+
+# contrasts(Lasso$status)  # contrast() function indicates that R has created a dummy variable with a 1 for "D" - Dead trees
+
+
+Predicted.Direction <- ifelse(Probability>0.5,"D","A")
+Predicted.Direction
+
+Lasso_conf <- table("Predicted"=Predicted.Direction,"Actual"=Lasso_test$status)
+Lasso_conf
+
+TruN <- Lasso_conf[1,1] # correct alive predictions
+TruP <- Lasso_conf[2,2] # correct dead predictions
+FalP <- Lasso_conf[2,1] # actual dead, predicted alive
+FalN <- Lasso_conf[1,2] # actual alive, predicted dead
+TotN <- Lasso_conf[1,1] + Lasso_conf[2,1] # actual total  Alive
+TotP <- Lasso_conf[1,2] + Lasso_conf[2,2]  # actual total Dead
+Tot <- TotN + TotP
+
+TotUA <-  Lasso_conf[1,1] + Lasso_conf[1,2] 
+TotDA <-  Lasso_conf[2,1] + Lasso_conf[2,2] 
+
+Kappa <-(Tot *(TruN + TruP) - ((TotUA*TotN) + (TotDA* TotP)))/((Tot^2) - ((TotUA*TotN) + (TotDA* TotP))) # 79.83
+
+Accuracy <- (TruN+TruP)/Tot
+Error <- (FalN+FalP)/Tot
+sensitivity <- TruP/TotP # How good is our model at predicting positive - D
+Specificity <- TruN/TotN # How good is our model at predicting negative - A
+FalPos <- 1- Specificity # Predicting as dead when its alive
+
+c("Accuracy"=Accuracy, "Error"=Error, "sensitivity"=sensitivity, "Specificity"=Specificity, "FalPos"=FalPos, "Kappa"=Kappa)
+
+
+
+ll.null <- glm.fits$null.deviance/-2
+ll.proposed <- glm.fits$deviance/-2
+
+(ll.null - ll.proposed) / ll.null  # Rsquared = 0.58
+```
+
+## Logistic regression with team picked variables from all 3 models
+
+```{r}
+set.seed(1)
+n= length(finaldf$status)
+
+Z = sample(1:nrow(finaldf), 0.7*nrow(finaldf))
+finaldf_train <- finaldf[Z,]
+finaldf_test <- finaldf[-Z,]
+
+
+glm.fits = glm(status~ ., data = finaldf_train, family = binomial)
+summary(glm.fits)
+
+Probability = predict(glm.fits,finaldf_test, type="response")
+
+# contrasts(finaldf$status)  # contrast() function indicates that R has created a dummy variable with a 1 for "D" - Dead trees
+
+
+Predicted.Direction <- ifelse(Probability>0.5,"D","A")
+
+
+finaldf_conf <- table("Predicted"=Predicted.Direction,"Actual"=finaldf_test$status)
+finaldf_conf
+
+TruN <- finaldf_conf[1,1] # correct alive predictions
+TruP <- finaldf_conf[2,2] # correct dead predictions
+FalP <- finaldf_conf[2,1] # actual dead, predicted alive
+FalN <- finaldf_conf[1,2] # actual alive, predicted dead
+TotN <- finaldf_conf[1,1] + finaldf_conf[2,1] # actual total  Alive
+TotP <- finaldf_conf[1,2] + finaldf_conf[2,2]  # actual total Dead
+Tot <- TotN + TotP
+TotUA <-  finaldf_conf[1,1] + finaldf_conf[1,2] 
+TotDA <-  finaldf_conf[2,1] + finaldf_conf[2,2] 
+
+Kappa <-(Tot *(TruN + TruP) - ((TotUA*TotN) + (TotDA* TotP)))/((Tot^2) - ((TotUA*TotN) + (TotDA* TotP)))
+
+Accuracy <- (TruN+TruP)/Tot
+Error <- (FalN+FalP)/Tot
+sensitivity <- TruP/TotP # How good is our model at predicting positive - D
+Specificity <- TruN/TotN # How good is our model at predicting negative - A
+FalPos <- 1- Specificity # Predicting as dead when its alive
+
+c("Accuracy"=Accuracy, "Error"=Error, "sensitivity"=sensitivity, "Specificity"=Specificity, "FalPos"=FalPos, "Kappa"=Kappa)
+
+ll.null <- glm.fits$null.deviance/-2
+ll.proposed <- glm.fits$deviance/-2
+
+(ll.null - ll.proposed) / ll.null  # Rsquared = 0.52/
+```
+
+
+# Nonparametric Models
+
+##  Classification tree
+
+```{r}
+class.tree <- tree(status ~., data=fwd, mindev=0.005)
+
+summary(class.tree) # summary function here lists the variables that are used as internal nodes in the tree, the number of terminal nodes, and the training error rate
+```
+
+We see that the training error rate is 7.5%. A small deviance indicates a tree that provides a good fit to the training data. 
+
+One of the most attractive properties of trees is that they can be graphically displayed.
+
+```{r}
+plot(class.tree,type ="uniform")
+text(class.tree, pretty=0)
+title(main = "Unpruned Classification Tree")
+```
+
+In order to properly evaluate the performance of a classification tree on these data, we must estimate the test error rather than simply computing the training error.
+
+```{r}
+# estimate the correct classification rate by cross validation. 
+
+set.seed(1)
+
+n= length(fwd$status)
+
+Z = sample(1:nrow(fwd), 0.7*nrow(fwd))
+
+train.tree = tree(status ~ .,data=fwd[Z,])
+
+
+status.predict = predict(train.tree,fwd, type = "class")
+
+# test confusion
+table(status.predict[-Z], fwd$status[-Z])
+
+
+accuracy = function(actual, predicted) {
+  mean(actual == predicted)
+}
+
+# train accuracy
+# accuracy(predicted = status.predict[Z], actual = fwd$status[Z])
+
+# test accuracy
+accuracy(predicted = status.predict[-Z], actual = fwd$status[-Z])  # 0.875
+```
+
+We will now use cross-validation to find a tree by considering trees of different sizes which have been pruned from our original tree. The function cv.tree() performs cross valiation in order to determine the optimal level of tree complexity; FUN = prune.misclass to indicated that we want the classification error rate to guide the cross-validation and pruning process rather than the default cv.tree(), which is a deviance.
+
+```{r}
+# Using cross validation to determine the optimal complexity of a tree and the number of terminal nodes that minimizes the deviance. 
+
+#cv = cv.tree(train.tree)
+# cv
+# plot(cv)
+
+# instead of optimizing by the smallest deviance, optimize the complexity and the number of terminal nodes by the smallest mis-classification error
+
+cv = cv.tree(train.tree, FUN = prune.misclass)
+cv
+plot(cv)
+
+cv = cv.tree(train.tree)
+plot(cv)
+
+#prune the tree to the optimal size which is 2 obtained above
+
+tree.pruned = prune.misclass(train.tree, best = 2)
+
+plot(tree.pruned)
+text(tree.pruned, pretty=0)
+title(main = "Pruned Classification Tree")
+```
+
+How well does this pruned tree perform on the test dataset?
+
+```{r}
+# tree.pred = predict(tree.pruned,fwd[-Z])
+```
+
+## Random Forest
+
+From our training results, the rf_mtry model appears to perform the best with about 87.67% accuracy and 68.28% kappa using mtry=16.
+
+model          | Accuracy       | Kappa
+:------------- | :------------- | :-------------
+rf_default     | 0.8466667      | 0.6827506
+**rf_mtry**    | **0.8766667**  | **0.7424242**
+rf_maxnode     | 0.8366667      | 0.6655012
+rf_maxtrees    | 0.8233333      | 0.6442890
+rf_fit         | 0.8500000      | 0.6878788
+
+However, when we ran the models against our test set, our rf_fit/final model performed the better with 95.83% accuracy and 90.32% kappa. After running our Random Forest model with various mtry, maxnode and ntree hyperparameters, we settled on 16, 7 and 450 respectively.
+
+model          | Accuracy       | Kappa
+:------------- | :------------- | :-------------
+rf_default     | 0.9166667      | 0.8139535
+rf_mtry        | 0.8750000      | 0.7096774
+rf_maxnode     | 0.9166667      | 0.7983193
+rf_maxtrees    | 0.9166667      | 0.7983193
+**rf_fit**     | **0.9583333**  | **0.9032258**
+
+Accuracy Assessment for rf_fit model:
+
+Status          | Producer's Accuracy | Omission       | User's Accuracy | Commission
+:-------------  | :-------------      | :------------- | :-------------  | :------------- 
+Alive           | 0.94117647          | 0.05882353     | 1               | 0
+Dead            | 1                   | 0              | 0.875           | 0.125
+
+Below is the table of the top 5 importance variables for our final model (rf_fit):
+
+Variable       | Importance 
+:------------- | :------------- 
+G_ratio        | 100.00
+greenness_90p  | 64.94
+greenness_75p  | 63.44
+green_norm_mean| 62.39
+G_R_ratio_2    | 54.20
+
+```{r}
+set.seed(1)
+
+training <- sample(1:nrow(model_df), 0.7*nrow(model_df))
+train_set <- model_df[training,]
+test_set <- model_df[-training,]
+
+set.seed(1)
+
+# Define the control
+trControl <- trainControl(method = "cv", number = 10, search = "grid")
+
+# Run default model
+rf_default <- train(status ~., data=train_set, method="rf", metric="Accuracy", trControl=trControl)
+rf_default # mtry=27, Accuracy=0.8466667 and Kappa=0.6827506
+
+res_rf_default <- as_tibble(rf_default$results[which.max(rf_default$results[,2]),]) %>%
+  mutate(model = "rf_default") %>% as.data.frame()
+
+rf_pred <- predict(rf_default, test_set)
+rf_pred
+
+mat_rf <- confusionMatrix(rf_pred, test_set$status)$overall %>%
+  t() %>%
+  as.data.frame() %>%
+  mutate(model = "rf_default") 
+mat_rf # Accuracy=0.9166667 and Kappa	0.8139535
+
+
+# Search best mtry
+set.seed(1)
+
+tuneGrid <- expand.grid(.mtry = c(1:53))
+rf_mtry <- train(status ~., data=train_set, method="rf", metric="Accuracy", tuneGrid=tuneGrid, trControl=trControl,
+                 importance=TRUE)
+
+#rf_mtry #mtry=16, Accuracy=0.8666667 and Kappa=0.7212121
+
+c("best_mtry" = rf_mtry$bestTune$mtry, "Accuracy" = max(rf_mtry$results$Accuracy))
+
+best_mtry <- rf_mtry$bestTune$mtry # 16 with accuracy of 0.8933333
+
+tuneGrid <- expand.grid(.mtry = best_mtry)
+
+rf_mtry <- train(status ~., data=train_set, method="rf", metric="Accuracy", tuneGrid=tuneGrid, trControl=trControl,
+                 importance=TRUE)
+
+res_rf_mtry <- as_tibble(rf_mtry$results[which.max(rf_mtry$results[,2]),]) %>%
+  mutate(model = "rf_mtry") %>% as.data.frame()
+
+rf_mtry_pred <- predict(rf_mtry, test_set)
+rf_mtry_pred
+
+mat_rf_mtry <- confusionMatrix(rf_mtry_pred, test_set$status)$overall %>%
+  t() %>%
+  as.data.frame() %>%
+  mutate(model = "rf_mtry") 
+mat_rf_mtry # Accuracy=0.875 and Kappa=0.7096774
+
+
+# Search the best maxnodes
+store_maxnode <- list()
+tuneGrid <- expand.grid(.mtry = best_mtry)
+
+for (maxnodes in c(5:15)) {
+  set.seed(1)
+  rf_maxnode <- train(status~.,
+                      data = train_set,
+                      method = "rf",
+                      metric = "Accuracy",
+                      tuneGrid = tuneGrid,
+                      trControl = trControl,
+                      importance = TRUE,
+                      maxnodes = maxnodes)
+  current_iteration <- toString(maxnodes)
+  store_maxnode[[current_iteration]] <- rf_maxnode
+}
+results_maxnode <- resamples(store_maxnode)
+summary_maxnode <- summary(results_maxnode)
+
+best_maxnode <- as.numeric(names(which.max(summary_maxnode$statistics$Accuracy[,4])))
+
+rf_maxnode <- train(status ~., data=train_set, method="rf", metric="Accuracy",
+                 tuneGrid = tuneGrid,
+                 trControl=trControl,
+                 importance=TRUE,
+                 maxnodes=best_maxnode)
+
+res_rf_maxnode <- as_tibble(rf_maxnode$results[which.max(rf_maxnode$results[,2]),]) %>%
+  mutate(model = "rf_maxnode") %>% as.data.frame() # mtry=16, Accuracy=0.85 and Kappa=0.6878788	
+
+rf_maxnode_pred <- predict(rf_maxnode, test_set)
+rf_maxnode_pred
+
+mat_rf_maxnode <- confusionMatrix(rf_maxnode_pred, test_set$status)$overall %>%
+  t() %>%
+  as.data.frame() %>%
+  mutate(model = "rf_maxnode") 
+mat_rf_maxnode # Accuracy=0.9166667 and Kappa=0.7983193
+
+
+# Search for best ntrees
+store_maxtrees <- list()
+
+for (ntree in c(250, 300, 350, 400, 450, 500, 550, 600, 800, 1000, 2000)) {
+  set.seed(1)
+  rf_maxtrees <- train(status~.,
+                       data = train_set,
+                       method = "rf",
+                       metric = "Accuracy",
+                       tuneGrid = tuneGrid,
+                       trControl = trControl,
+                       importance = TRUE,
+                       maxnodes = best_maxnode,
+                       ntree = ntree)
+  key <- toString(ntree)
+  store_maxtrees[[key]] <- rf_maxtrees
+}
+results_tree <- resamples(store_maxtrees)
+summary_ntree <- summary(results_tree)
+
+best_ntree <- as.numeric(names(which.max(summary_ntree$statistics$Accuracy[,4])))
+
+rf_maxtrees <- train(status ~., data=train_set, method="rf", metric="Accuracy",
+                 tuneGrid = tuneGrid,
+                 trControl=trControl,
+                 importance=TRUE,
+                 maxnodes=best_maxnode,
+                 ntree=best_ntree)
+
+res_rf_maxtrees <- as_tibble(rf_maxtrees$results[which.max(rf_maxtrees$results[,2]),]) %>%
+  mutate(model = "rf_maxtrees") %>% as.data.frame() # mtry=16, Accuracy=0.85 and Kappa=0.6878788	
+
+rf_maxtrees_pred <- predict(rf_maxtrees, test_set)
+rf_maxtrees_pred
+
+mat_rf_maxtrees <- confusionMatrix(rf_maxtrees_pred, test_set$status)$overall %>%
+  t() %>%
+  as.data.frame() %>%
+  mutate(model = "rf_maxtrees") 
+mat_rf_maxtrees # Accuracy=0.9166667 and Kappa=0.7983193	
+
+
+# Using the above model
+set.seed(1)
+
+rf_fit <- train(status~.,
+                train_set,
+                method = "rf",
+                metric = "Accuracy",
+                tuneGrid = tuneGrid,
+                trControl = trControl,
+                maxnodes = best_maxnode,
+                ntree = best_ntree,
+                importance = TRUE)
+
+rf_fit # Accuracy=0.85 and Kappa=0.6878788
+
+# Evaluate the model
+res_rf_fit <- as_tibble(rf_fit$results[which.max(rf_fit$results[,2]),]) %>%
+  mutate(model = "rf_fit") %>% as.data.frame() # mtry=16, Accuracy=0.85 and Kappa=0.6878788	
+
+rf_fit_pred <- predict(rf_fit, test_set)
+rf_fit_pred
+
+mat_rf_fit <- confusionMatrix(rf_fit_pred, test_set$status)$overall %>%
+  t() %>%
+  as.data.frame() %>%
+  mutate(model = "rf_fit") 
+mat_rf_fit # Accuracy=0.9583333 and Kappa=0.9032258
+
+conf_rf_fit <- confusionMatrix(table(rf_fit_pred, test_set$status))$table
+conf_rf_fit
+
+c("A Producer's Accuracy"=conf_rf_fit[1,1]/sum(conf_rf_fit[,1]),"A Omission"=1-(conf_rf_fit[1,1]/sum(conf_rf_fit[,1]))) # 94.12% (5.88%)
+
+c("D Producer's Accuracy"=conf_rf_fit[2,2]/sum(conf_rf_fit[,2]),"D Omission"=1-(conf_rf_fit[2,2]/sum(conf_rf_fit[,2]))) # 100% (0%)
+
+c("A User's Accuracy"=conf_rf_fit[1,1]/sum(conf_rf_fit[1,]),"A Commission"=1-(conf_rf_fit[1,1]/sum(conf_rf_fit[1,]))) # 100% (0%)
+
+c("D User's Accuracy"=conf_rf_fit[2,2]/sum(conf_rf_fit[2,]),"D Commission"=1-(conf_rf_fit[2,2]/sum(conf_rf_fit[2,]))) # 87.5% (12.5%)
+
+var_imp <- varImp(rf_fit)
+var_imp # Top 5 variables need to be explained
+
+plot(var_imp) # all
+
+rf_results <- bind_rows(res_rf_default, res_rf_mtry, res_rf_maxnode, res_rf_maxtrees, res_rf_fit) %>%
+  dplyr::select(model, mtry, Accuracy, Kappa)
+rf_results
+
+rf_pred_results <- bind_rows(mat_rf, mat_rf_mtry, mat_rf_maxnode, mat_rf_maxtrees, mat_rf_fit) %>%
+  dplyr::select(model, Accuracy, Kappa)
+rf_pred_results
+```
+
+## Support Vector Machine
+
+From our training results, the radial SVM non-linear model appears to perform the best with about 90.67% accuracy and 80.45% kappa using C=0.0.2105263 and sigma=0.010.
+
+model              | Accuracy       | Kappa          | C              | sigma
+:-------------     | :------------- | :------------- | :------------- | :-------------
+svm_Linear         | 0.7566667      | 0.5128205      | 1.0000000      | NA
+svm_Linear_Grid    | 0.8366667      | 0.6724942      | 0.1052632      | NA
+svm_Radial         | 0.8500000      | 0.6872960      | 0.5000000      | 0.01763192
+**svm_Radial_Grid**| **0.9133333**  | **0.8212121**  | **0.2105263**  | **0.010**
+
+However, when we ran the models against our test set, our svm_Linear_Grid model performed better with about 95.83% accuracy and 90.32% kappa.
+
+model               | Accuracy       | Kappa
+:-------------      | :------------- | :------------- 
+svm_Linear          | 0.7916667      | 0.5833333		
+**svm_Linear_Grid** | **0.9583333**  | **0.9032258**		
+svm_Radial          | 0.9166667      | 0.7983193		
+svm_Radial_Grid     | 0.9166667      | 0.7983193	
+
+Accuracy Assessment for svm_Linear_Grid model:
+
+Status          | Producer's Accuracy | Omission       | User's Accuracy | Commission
+:-------------  | :-------------      | :------------- | :-------------  | :------------- 
+Alive           | 0.94117647          | 0.05882353     | 1               | 0
+Dead            | 1                   | 0              | 0.875           | 0.125
+
+```{r warning=FALSE}
+# Preparing Datasets ----
+set.seed(1)
+
+training <- sample(1:nrow(model_df), 0.7*nrow(model_df))
+train_set <- model_df[training,]
+test_set <- model_df[-training,]
+
+set.seed(1)
+
+trctrl <- trainControl(method = "CV", number = 10)
+
+# Linear
+svm_Linear <- train(status ~., data = train_set, method = "svmLinear",
+                    trControl=trctrl,
+                    preProcess = c("center", "scale"),
+                    tuneLength = 10)
+
+svm_Linear # Accuracy=0.7566667 and Kappa=0.5128205
+
+res_svm_Linear <- as_tibble(svm_Linear$results[which.max(svm_Linear$results[,2]),]) %>%
+  mutate(model = "svm_Linear") %>% as.data.frame()
+
+test_pred <- predict(svm_Linear, newdata = test_set)
+test_pred
+
+mat_Linear <- confusionMatrix(table(test_pred, test_set$status))$overall %>%
+  t() %>%
+  as.data.frame() %>%
+  mutate(model = "svm_Linear") 
+mat_Linear # Accuracy=0.7916667	and Kappa=0.5833333
+
+# Linear Grid
+set.seed(1)
+
+grid <- expand.grid(C = seq(0, 2, length = 20))
+svm_Linear_Grid <- train(status ~., data = train_set, method = "svmLinear",
+                         trControl=trctrl,
+                         preProcess = c("center", "scale"),
+                         tuneGrid = grid,
+                         tuneLength = 10)
+
+# svm_Linear_Grid # C=0.1052632, Accuracy=0.8500000 and Kappa=0.6948718
+plot(svm_Linear_Grid)
+
+grid <- expand.grid(C = as.numeric(svm_Linear_Grid$results[,1]))
+svm_Linear_Grid <- train(status ~., data = train_set, method = "svmLinear",
+                         trControl=trctrl,
+                         preProcess = c("center", "scale"),
+                         tuneGrid = grid,
+                         tuneLength = 10)
+
+res_svm_Linear_Grid <- as_tibble(svm_Linear_Grid$results[which.max(svm_Linear_Grid$results[,2]),]) %>%
+  mutate(model = "svm_Linear_Grid") %>% as.data.frame()
+
+test_pred_grid <- predict(svm_Linear_Grid, newdata = test_set)
+test_pred_grid
+
+mat_Linear_Grid <- confusionMatrix(table(test_pred_grid, test_set$status))$overall %>%
+  t() %>%
+  as.data.frame() %>%
+  mutate(model = "svm_Linear_Grid") 
+mat_Linear_Grid # Accuracy=0.9583333 and Kappa=0.9032258
+
+conf_Linear_Grid <- confusionMatrix(table(test_pred_grid, test_set$status))$table
+conf_Linear_Grid
+
+c("A Producer's Accuracy"=conf_Linear_Grid[1,1]/sum(conf_Linear_Grid[,1]),"A Omission"=1-(conf_Linear_Grid[1,1]/sum(conf_Linear_Grid[,1]))) # 94.12% (5.88%)
+
+c("D Producer's Accuracy"=conf_Linear_Grid[2,2]/sum(conf_Linear_Grid[,2]),"D Omission"=1-(conf_Linear_Grid[2,2]/sum(conf_Linear_Grid[,2]))) # 100% (0%)
+
+c("A User's Accuracy"=conf_Linear_Grid[1,1]/sum(conf_Linear_Grid[1,]),"A Commission"=1-(conf_Linear_Grid[1,1]/sum(conf_Linear_Grid[1,]))) # 100% (0%)
+
+c("D User's Accuracy"=conf_Linear_Grid[2,2]/sum(conf_Linear_Grid[2,]),"D Commission"=1-(conf_Linear_Grid[2,2]/sum(conf_Linear_Grid[2,]))) # 87.5% (12.5%)
+
+# Radial
+set.seed(1)
+
+svm_Radial <- train(status ~., data = train_set, method = "svmRadial",
+                    trControl = trctrl,
+                    preProcess = c("center","scale"),
+                    tuneLength = 10)
+svm_Radial # C=0.50, Accuracy=0.8500000 and Kappa=0.6872960
+
+res_svm_Radial <- as_tibble(svm_Radial$results[which.max(svm_Radial$results[,3]),]) %>%
+  mutate(model = "svm_Radial") %>% as.data.frame()
+
+svm_Radial$bestTune # C=0.5
+
+test_pred_radial <- predict(svm_Radial, newdata = test_set)
+test_pred_radial
+
+mat_Radial <- confusionMatrix(table(test_pred_radial, test_set$status))$overall %>%
+  t() %>%
+  as.data.frame() %>%
+  mutate(model = "svm_Radial") 
+mat_Radial # Accuracy=0.9166667 and Kappa=0.7983193	
+
+# Radial Grid
+set.seed(1)
+
+grid_radial <- expand.grid(sigma = c(0, 0.01, 0.1052632, 0.02, 0.025, 0.03, 0.04,
+                                       0.05, 0.06, 0.07,0.08, 0.09, 0.1, 0.25, 0.5, 0.75, 0.9),
+                             C = seq(0, 2, length = 20))
+svm_Radial_Grid <- train(status ~., data = train_set, method = "svmRadial",
+                           trControl=trctrl,
+                           preProcess = c("center", "scale"),
+                           tuneGrid = grid_radial,
+                           tuneLength = 10)
+
+# svm_Radial_Grid # sigma=0.01, c=0.3157895, Accuracy=0.9066667 and Kappa=0.8045455	
+
+
+plot(svm_Radial_Grid)
+
+grid_radial <- expand.grid(sigma = as.numeric(svm_Radial_Grid$results[,1]),
+                             C = as.numeric(svm_Radial_Grid$results[,2]))
+svm_Radial_Grid <- train(status ~., data = train_set, method = "svmRadial",
+                           trControl=trctrl,
+                           preProcess = c("center", "scale"),
+                           tuneGrid = grid_radial,
+                           tuneLength = 10)
+
+
+res_svm_Radial_Grid <- as_tibble(svm_Radial_Grid$results[which.max(svm_Radial_Grid$results[,3]),]) %>%
+  mutate(model = "svm_Radial_Grid") %>% as.data.frame() # sigma=0.01 and C=0.3157895
+
+test_pred_Radial_Grid <- predict(svm_Radial_Grid, newdata = test_set)
+test_pred_Radial_Grid
+
+mat_Radial_Grid <- confusionMatrix(test_pred_Radial_Grid, test_set$status)$overall %>%
+  t() %>%
+  as.data.frame() %>%
+  mutate(model = "svm_Radial_Grid")
+mat_Radial_Grid # Accuracy=0.9166667 and Kappa=0.7983193
+
+svm_results <- bind_rows(res_svm_Linear, res_svm_Linear_Grid, res_svm_Radial, res_svm_Radial_Grid) %>%
+  dplyr::select(model, C:sigma)
+svm_results
+
+svm_pred_results <- bind_rows(mat_Linear, mat_Linear_Grid, mat_Radial, mat_Radial_Grid) %>%
+  dplyr::select(model, Accuracy, Kappa)
+svm_pred_results
+```

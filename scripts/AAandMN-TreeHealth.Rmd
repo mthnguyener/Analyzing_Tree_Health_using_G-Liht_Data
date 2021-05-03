@@ -1,0 +1,577 @@
+---
+title: 
+output:
+  revealjs::revealjs_presentation:
+    self_contained: false
+    reveal_plugins: ["search", "zoom", "menu"]
+    reveal_options:
+    theme: dark
+    menu:
+      numbers: true
+
+---
+
+```{r setup, echo=FALSE, message=FALSE, warning=FALSE}
+knitr::opts_knit$set(echo = FALSE,
+                     message = FALSE,
+                     warning = FALSE,
+                     ggplot2::theme_set(ggplot2::theme_bw()),
+                     # root.dir = "F:/Users/aa0856a/ENVS_RS Dropbox/Projects/pix4d/201807XX_Denali_FHM_06/"
+                     root.dir = "C:/Users/Minh Nguyen/ENVS_RS Dropbox/Projects/pix4d/201807XX_Denali_FHM_06/"
+                     )
+
+library(tidyverse)
+library(leaps)
+library(ggplot2)
+library(cowplot)
+library(shiny)
+library(shinythemes)
+library(png)
+library(randomForest)
+library(dplyr)
+library(stringr)
+library(caret)
+library(car)
+library(splitstackshape)
+library(MASS)
+library(pracma)
+library(philentropy)
+library(raster)
+library(rgdal)
+library(tree)
+library(ForestTools)
+library(lidR)
+library(mapview)
+library(corrplot)  #for correlogram
+library(e1071)  #for skewness() and kurtosis()
+library(gridExtra)  #for grid.arrange()
+library(RANN)
+library(leaps)
+library(jmv) # frequency table/stat
+library(glmnet)
+```
+
+``` {r echo=FALSE}
+raw_df <- read.csv( "../../STV/code/R/AliyaMinh/data/raw_df.csv") %>% 
+  mutate(region = as.factor(region),
+         status = as.factor(status))
+
+model_df <- raw_df %>%
+  group_by(treeid) %>%
+  #find color statistics
+  mutate(height = max(Z),
+         ht_mean = mean(Z),
+         ht_skw_Sp = skewness(Z),
+         ht_kurt_sp = kurtosis(Z),
+         ht_75p = as.numeric(quantile(Z, 0.75)),
+         ht_90p = as.numeric(quantile(Z, 0.9)), 
+         ht_98p = as.numeric(quantile(Z, 0.98)),
+         green_75p = mean(G[Z >= ht_75p]),
+         green_90p = mean(G[Z >= ht_90p]),
+         green_98p = mean(G[Z >= ht_98p]),
+         red_75p = mean(R[Z >= ht_75p]),
+         red_90p = mean(R[Z >= ht_90p]),
+         red_98p = mean(R[Z >= ht_98p]),
+         blue_75p = mean(B[Z >= ht_75p ]),
+         blue_90p = mean(B[Z >= ht_90p]),
+         blue_98p = mean(B[Z >= ht_98p]),
+         greenness_75p = mean(G[Z >= ht_75p]/(R[Z >= ht_75p]+B[Z >= ht_75p])),
+         greenness_90p = mean(G[Z >= ht_90p]/(R[Z >= ht_90p]+B[Z >= ht_90p])),
+         greenness_98p = mean(G[Z >= ht_98p]/(R[Z >= ht_98p]+B[Z >= ht_98p])),
+         redness_75p = mean(R[Z >= ht_75p]/(G[Z >= ht_75p]+B[Z >= ht_75p])),
+         redness_90p = mean(R[Z >= ht_90p]/(G[Z >= ht_90p]+B[Z >= ht_90p])),
+         redness_98p = mean(R[Z >= ht_98p]/(G[Z >= ht_98p]+B[Z >= ht_98p])),
+         blueness_75p = mean(B[Z >= ht_75p]/(G[Z >= ht_75p]+R[Z >= ht_75p])),
+         blueness_90p = mean(B[Z >= ht_90p]/(G[Z >= ht_90p]+R[Z >= ht_90p])),
+         blueness_98p = mean(B[Z >= ht_98p]/(G[Z >= ht_98p]+R[Z >= ht_98p])),
+         med_height = median(Z),
+         blueness_mean = mean((B - G)/(B + G)),
+         greenness_mean = mean((G - R)/(G + R)),
+         redness_mean = mean((R - B)/(R + B)),
+         blueness_std = sd((B - G)/(B + G)),
+         greenness_std = sd((G - R)/(G + R)),
+         redness_std = sd((R - B)/(R + B)),
+         blueness_med = median((B - G)/(B + G)),
+         greenness_med = median((G - R)/(G + R)),
+         redness_med = median((R - B)/(R + B)),
+         blueness_skw = skewness((B - G)/(B + G)),
+         greenness_skw = skewness((G - R)/(G + R)),
+         redness_skw = skewness((R - B)/(R + B)),
+         #find overall brightness statistics
+         brightness_mean = mean(B + G + R),
+         brightness_med = median(B + G + R),
+         brightness_std = sd(B + G + R),
+         brightness_skw = skewness(B + G + R),
+         #find normalized statistics
+         red_norm_mean = mean(R / (R + G + B)),
+         blue_norm_mean = mean(B / (R + G + B)),
+         green_norm_mean = mean(G / (R + G + B)),
+         R = mean(R),
+         G = mean(G),
+         B = mean(B),
+         R_ratio = R/(R + G + B ),
+         G_ratio = G/(R + G + B ),
+         B_ratio = B/(R + G + B ),
+         G_R_ratio = G/R,
+         G_R_ratio_2 = (G - R)/(G + R))%>% 
+  dplyr::select(Id, treeid, status, region, R:G_R_ratio_2)
+```
+
+
+# Analyzing Tree Health Using G-LiHT Data 
+
+Aliya Alimujiang and Minh Nguyen
+<br></br>
+```{r echo=FALSE, fig.width = 5, fig.height=3}
+img <- readPNG("../../STV/code/R/AliyaMinh/images/alaska.png")
+grid::grid.raster(img)
+
+```
+
+# Overview
+<br></br>
+
+ - Motivation
+ - Pre-Processing
+    - Descriptive Analytics
+    - Feature Extraction
+ - Variable Selection
+ - Models
+ - Conclusion
+ - Appendix
+
+
+## Motivation
+
+<div style="width: 50%; float:left;">
+
+Why tree health?
+```{r echo=FALSE, fig.width=6, fig.height=4}
+img <- readPNG("../../STV/code/R/AliyaMinh/images/tree_hugger.png")
+grid::grid.raster(img)
+```
+
+- The future is at stake
+- Private and Governments partnership
+  - "Green" $2.3T plan
+    
+</div>
+
+<div style="width: 50%; float:right;">
+
+Why this project?
+```{r echo=FALSE, fig.width=6, fig.height=4}
+img <- readPNG("../../STV/code/R/AliyaMinh/images/data_algorithms.png")
+grid::grid.raster(img)
+```
+
+- Great power comes great responsibility - Uncle Ben
+- Venture into point cloud
+
+</div>
+
+
+# Descriptive Analytics
+
+- Read all las files
+- Reproject Shp and las files
+  - get_las_crowns(las_all, fhm_crowns_shp)
+
+```{r echo=FALSE, fig.width=8, fig.height=5}
+img <- readPNG("../../STV/code/R/AliyaMinh/images/preprocessing.png")
+grid::grid.raster(img)
+```
+
+## Height distribution
+
+```{r echo=FALSE, fig.width=6, fig.height=4}
+img <- readPNG("../../STV/code/R/AliyaMinh/images/heightdistribution.png")
+grid::grid.raster(img)
+```
+
+<table>
+  <tr>
+    <th> mean</th>
+    <th> pct10</th>
+    <th> pct30</th>
+    <th> median</th>
+    <th> pct75</th>
+    <th> pct90</th>
+    <th> pct98</th>
+  </tr>
+  <tr>
+     <th> 10.33125</th>
+    <th> 1.92</th>
+    <th> 7.465</th>
+    <th> 10.76</th>
+    <th> 14.416</th>
+    <th> 16.8058</th>
+    <th> 21.67</th>
+  </tr>
+</table>
+
+## Alive vs Dead
+
+```{r echo=FALSE,  fig.width=6, fig.height=3}
+img <- readPNG("../../STV/code/R/AliyaMinh/images/alive_dead_pointcloud.png")
+grid::grid.raster(img)
+```
+
+```{r echo=FALSE,  fig.width=6, fig.height=3}
+img <- readPNG("../../STV/code/R/AliyaMinh/images/alivedead.png")
+grid::grid.raster(img)
+```
+
+## Feature Extraction
+
+How did we go from 6 to 53 variables?
+
+- Structural Variables (X, Y, Z):
+  - ht_90p: Height at 90%
+  - ht_skw_Sp: Height skewness
+- Spectral Variables (R, G, B):
+  - greenness_75p: Green ratio at 75% height
+  - green_norm_mean: Mean of Green over all Colors
+  - G_R_ratio_2: (G - R)/(G + R)
+
+The full list is in the Appendix II.
+
+## Correlation Matrix
+
+```{r echo=FALSE}
+img <- readPNG("../../STV/code/R/AliyaMinh/images/corr_plot.png")
+grid::grid.raster(img)
+```
+
+# Variable selection
+
+<div style="width: 50%; float:left;">
+```{r echo=FALSE, fig.width=4, fig.height=6}
+img <- readPNG("../../STV/code/R/AliyaMinh/images/descriptive.png")
+grid::grid.raster(img)
+
+```
+</div>
+
+
+<div style="width: 50%; float:right;">
+<br></br>
+
+- Forward 
+- Backward
+
+- n is not much larger than p 
+    - a lot of variability
+- Bias VS Variance trade off 
+</div>
+
+## Forward and Backward
+<div style="width: 50%; float:left;">
+Forward
+```{r echo=FALSE}
+img <- readPNG("../../STV/code/R/AliyaMinh/images/forward.png")
+grid::grid.raster(img)
+
+```
+</div>
+
+<div style="width: 50%; float:right;">
+Backward
+```{r echo=FALSE}
+img <- readPNG("../../STV/code/R/AliyaMinh/images/backward.png")
+grid::grid.raster(img)
+```
+</div>
+
+## Variables Kept
+
+<div style="width: 50%; float:left;">
+- Forward: 
+   - ht_98p
+   - green_98p
+    - red_98p
+    - brightness_Std
+    - red_norm_mean
+    - G_ratio
+    - G_R_ratio_2
+    - green_norm_mean
+    - B_ratio
+</div>
+
+<div style="width: 50%; float:right;">
+- Backward: 
+  - red_75p
+  - redness_75p
+  - redness_98p
+  - blue_norm_mean
+  - R_ratio
+  - G_R_ratio
+  - green_norm_mean
+  - B_ratio
+</div>
+
+# Models
+
+```{r echo=FALSE, fig.width=3, fig.height=2}
+img <- readPNG("../../STV/code/R/AliyaMinh/images/predictive_modeling.png")
+grid::grid.raster(img)
+```
+
+- Parametric
+  - Logistic Regression
+  - Lasso
+- Nonparametric
+  - Random Forrest
+  - SVM
+
+
+## Logistic Regression
+
+```{r echo=FALSE,message=FALSE }
+
+# model_df <-model_df %>% group_by(treeid) %>% 
+#   filter(row_number()==1) %>%
+#   as.data.frame() %>%
+#   dplyr::select(-c(treeid, Id, region))
+# 
+# model_df <- model_df %>%
+#   filter(status != "G") %>%
+#   mutate(status = factor(status))
+# 
+# fwd <- model_df%>%
+#   dplyr::select(status,ht_98p, green_98p, red_98p, brightness_std, red_norm_mean, G_ratio, G_R_ratio_2, green_norm_mean, B_ratio )
+# 
+# set.seed(1)
+# n= length(fwd$status)
+# 
+# Z = sample(1:nrow(fwd), 0.7*nrow(fwd))
+# fwd_train <- fwd[Z,]
+# fwd_test <- fwd[-Z,]
+# 
+# 
+# 
+# glm.fits = glm(status~ ., data = fwd_train, family = binomial)
+# 
+# 
+# Prob=fitted.values(glm.fits)
+# 
+# 
+# Probability = predict(glm.fits,fwd_test, type="response")
+# 
+# Prob=fitted.values(glm.fits)
+# 
+# # We will classify "Dead trees" as having the probability that exceeds 0.5.
+# 
+# Predicted.Direction <- ifelse(Probability>0.5,"D","A")
+# 
+# 
+# fwd_conf <- table("Predicted"=Predicted.Direction,"Actual"=fwd_test$status)
+# # fwd_conf
+```
+
+Fwd Conf Matrix| Actual         
+:------------- | :------------- | :-------------
+Predicted      | A              | D
+A              | 16             | 0
+D              | 1              | 7
+
+Accuracy and Kappa
+
+model          | Accuracy       | Kappa
+:------------- | :------------- | :-------------
+forward        | 0.95833333     | 0.90322581
+
+Accuracy Assessment for fwd_glm model:
+
+Status          | Producer's Accuracy | Omission       | User's Accuracy | Commission
+:-------------  | :-------------      | :------------- | :-------------  | :------------- 
+Alive           | 0.94117647          | 0.05882353     | 1               | 0
+Dead            | 1                   | 0              | 0.875           | 0.125
+
+## Logistic Regression
+
+Accuracy and Kappa
+
+model          | Accuracy       | Kappa
+:------------- | :------------- | :-------------
+backward       | 0.8750000      | 0.7096774
+
+Accuracy Assessment for bwd_glm model:
+
+Status          | Producer's Accuracy | Omission       | User's Accuracy | Commission
+:-------------  | :-------------      | :------------- | :-------------  | :------------- 
+Alive           | 0.8823529           | 0.1176471      | 0.9375          | 0.3750 
+Dead            | 0.8571429           | 0.1428571      | 0.75            | 0.25
+
+
+## LASSO
+```{r echo=FALSE, fig.width=5, fig.height=3}
+img <- readPNG("../../STV/code/R/AliyaMinh/images/lasso_lambda.png")
+grid::grid.raster(img)
+```
+
+model          | Accuracy       | Kappa
+:------------- | :------------- | :-------------
+Lasso          | 0.8250000      | 0.61538462
+
+Accuracy Assessment for LASSO  model:
+
+Status          | Producer's Accuracy | Omission       | User's Accuracy | Commission
+:-------------  | :-------------      | :------------- | :-------------  | :------------- 
+Alive           | 0.95833333          | 0.04166667     | 0.7931034       | 0.4250000
+Dead            | 0.625               | 0.375          | 0.90909091      | 0.09090909
+
+
+## Random Forrest
+
+- Intuition: P is about 2/3 of our observations
+- Hyperparameters: mtry, maxnode and ntree
+- rf_mtry performed the best originally but rt_fit model had the best result on the test dataset.
+
+<div style="width: 45%; float: left;">
+Initial Run
+
+model          | Accuracy       | Kappa
+:------------- | :------------- | :-------------
+rf_default     | 0.8466667      | 0.6827506
+**rf_mtry**    | **0.8766667**  | **0.7424242**
+rf_maxnode     | 0.8366667      | 0.6655012
+rf_maxtrees    | 0.8233333      | 0.6442890
+rf_fit         | 0.8500000      | 0.6878788
+</div>
+
+<div style="width: 10%; float: center;">
+</div>
+
+
+<div style="width: 45%; float: right;">
+Test Data
+
+model          | Accuracy       | Kappa
+:------------- | :------------- | :-------------
+rf_default     | 0.9166667      | 0.8139535
+rf_mtry        | 0.8750000      | 0.7096774
+rf_maxnode     | 0.9166667      | 0.7983193
+rf_maxtrees    | 0.9166667      | 0.7983193
+**rf_fit**     | **0.9583333**  | **0.9032258**
+</div>
+
+
+## Accuracy Assessment for rf_fit model:
+
+Status          | Producer's Accuracy | Omission       | User's Accuracy | Commission
+:-------------  | :-------------      | :------------- | :-------------  | :------------- 
+Alive           | 0.94117647          | 0.05882353     | 1               | 0
+Dead            | 1                   | 0              | 0.875           | 0.125
+
+Below is the table of the top 5 importance variables for our final model (rf_fit):
+
+Variable       | Importance 
+:------------- | :------------- 
+G_ratio        | 100.00
+greenness_90p  | 64.94
+greenness_75p  | 63.44
+green_norm_mean| 62.39
+G_R_ratio_2    | 54.20
+
+## SVM
+
+- Intuition: Captures complex relationships
+- Hyperparameters: Linear/Radial, Cost, and sigma 
+- Radial_Grid performed the best originally but the Linear_Grid model had the best result on the test dataset.
+<br></br>
+
+model              | Accuracy       | Kappa          | C              | sigma
+:-------------     | :------------- | :------------- | :------------- | :-------------
+svm_Linear         | 0.7566667      | 0.5128205      | 1.0000000      | NA
+svm_Linear_Grid    | 0.8366667      | 0.6724942      | 0.1052632      | NA
+svm_Radial         | 0.8500000      | 0.6872960      | 0.5000000      | 0.01763192
+**svm_Radial_Grid**| **0.9133333**  | **0.8212121**  | **0.2105263**  | **0.010**
+
+model               | Accuracy       | Kappa
+:-------------      | :------------- | :------------- 
+svm_Linear          | 0.7916667      | 0.5833333		
+**svm_Linear_Grid** | **0.9583333**  | **0.9032258**		
+svm_Radial          | 0.9166667      | 0.7983193		
+svm_Radial_Grid     | 0.9166667      | 0.7983193
+
+## SVM Accuracy and Kappa
+
+Accuracy Assessment for svm_Linear_Grid model:
+
+Status          | Producer's Accuracy | Omission       | User's Accuracy | Commission
+:-------------  | :-------------      | :------------- | :-------------  | :------------- 
+Alive           | 0.94117647          | 0.05882353     | 1               | 0
+Dead            | 1                   | 0              | 0.875           | 0.125
+
+```{r echo=FALSE, fig.width=6, fig.height=4}
+img <- readPNG("../../STV/code/R/AliyaMinh/images/svm_plot.png")
+grid::grid.raster(img)
+```
+
+# Conclusion
+
+model               | Accuracy       | Kappa
+:------------------ | :------------- | :-------------
+forward             | **0.95833333** | **0.90322581**
+backward            | 0.8750000      | 0.7096774
+Lasso               | 0.8250000      | 0.61538462
+**rf_fit**          | **0.9583333**  | **0.9032258**
+**svm_Linear_Grid** | **0.9583333**  | **0.9032258**	
+
+<br></br>
+
+- Forward performed just as well in **THIS DATASET**
+  - Binary question
+  - Our recommended model
+- Might change with more observations
+
+## Next Steps
+
+- Missing SFM
+- Literature Review
+  - Feature Extraction
+- Gather more data
+   - Augmentation
+   - Artificial Data
+
+
+```{r echo=FALSE, fig.width=3, fig.height=3}
+img <- readPNG("../../STV/code/R/AliyaMinh/images/next_step.png")
+grid::grid.raster(img)
+```
+
+## Thank you!
+
+```{r echo=FALSE, fig.width=6, fig.height=4}
+img <- readPNG("../../STV/code/R/AliyaMinh/images/yoda.png")
+grid::grid.raster(img)
+```
+
+
+# Appendix I – References
+ 
+<small>
+
+- Dr. Alonzo and ENVS-685 Remote Sensing
+- NASA G-LiHT data
+- Tree species classification from airborne hyperspectral and LiDAR data using 3D convolutional neural networks
+- Urban tree species mapping using hyperspectral and lidar data fusion
+- Mapping tall shrub biomass in Alaska at landscape scale using structure-from-motion photogrammetry and lidar
+- Estimation of standing dead tree class distributions in northwest coastal forests using lidar remote sensing
+- Silvi-Net–A dual-CNN approach for combined classification of tree species and standing dead trees from remote sensing data
+- Species-related single dead tree detection using multi-temporal ALS data and CIR imagery
+- Distinguishing between live and dead standing tree biomass on the North Rim of Grand Canyon National Park
+- Detection of Standing Deadwood from Aerial Imagery Products: Two Methods for Addressing the Bare Ground Misclassification Issue
+- Individual tree segmentation from a leaf-off photogrammetric point cloud
+- Non-destructive aboveground biomass estimation of coniferous trees using terrestrial LiDAR
+
+</small>
+
+# Appendix II – Variables Dictionary
+
+```{r echo=FALSE, fig.width = 10, fig.height=6}
+img <- readPNG("../../STV/code/R/AliyaMinh/images/datatable.png")
+grid::grid.raster(img)
+```
+
